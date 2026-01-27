@@ -1,0 +1,17 @@
+# Polymarket Trading Module - Python
+# Requirements for limit order submission with L1 authentication
+
+# Polymarket CLOB client
+py-clob-client>=0.29.0
+
+# Web3 for token approvals
+web3>=6.0.0
+
+# Ethereum account management
+eth-account>=0.10.0
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# HTTP client
+httpx>=0.25.0
