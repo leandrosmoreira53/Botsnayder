@@ -3,6 +3,14 @@ name = "polymarket-arbitrage-bot"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "derive_api_keys"
+path = "src/bin/derive_api_keys.rs"
+
+[[bin]]
+name = "polymarket-arbitrage-bot"
+path = "src/main.rs"
+
 [dependencies]
 tokio = { version = "1.35", features = ["full"] }
 reqwest = { version = "0.11", features = ["json"] }
@@ -24,5 +32,6 @@ base64 = "0.21"
 ethers = { version = "2.0", features = ["abigen", "rustls"] }
 chrono = { version = "0.4", features = ["serde"] }
 dotenv = "0.15"
-polyte = "0.4.0"
-polyte-clob = "0.4.0"
+
+# Polymarket CLOB Client - para derivar API keys e fazer ordens
+polymarket-rs-client = "0.1.1"
