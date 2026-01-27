@@ -1,0 +1,16 @@
+{
+  "polymarket": {
+    "gamma_api_url": "https://gamma-api.polymarket.com",
+    "clob_api_url": "https://clob.polymarket.com",
+    "ws_url": "wss://clob-ws.polymarket.com",
+    "api_key": "COLE_SUA_API_KEY_AQUI"
+  },
+  "trading": {
+    "min_profit_threshold": 0.01,
+    "max_position_size": 100.0,
+    "eth_condition_id": null,
+    "btc_condition_id": null,
+    "check_interval_ms": 1000
+  }
+}
+
