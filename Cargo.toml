@@ -35,3 +35,6 @@ dotenv = "0.15"
 
 # Polymarket CLOB Client - para derivar API keys e fazer ordens
 polymarket-rs-client = "0.1.1"
+
+# UUID for nonces
+uuid = { version = "1.0", features = ["v4"] }

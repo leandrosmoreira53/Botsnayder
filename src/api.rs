@@ -323,108 +323,130 @@ impl PolymarketApi {
         }
     }
 
-    /// Place an order (for production mode) - LIMIT ORDER with EIP-712 signing
-    /// 
-    /// Uses EIP-712 signature authentication with private_key and funder_address.
+    /// Place an order (for production mode) - LIMIT ORDER
+    ///
+    /// Uses L2 API Key authentication (HMAC-SHA256) with POLY_* headers.
+    /// CRITICAL: Requires valid API credentials (api_key, api_secret, api_passphrase)
+    /// derived from L1 using derive_api_keys.rs script.
     pub async fn place_order(&self, order: &OrderRequest, is_production: bool) -> Result<OrderResponse> {
-        let url = format!("{}/orders", self.clob_url);
-        
-        // Build order JSON with proper structure for Polymarket CLOB API
+        // CRITICAL: Endpoint is /order (singular), NOT /orders
+        let url = format!("{}/order", self.clob_url);
+
+        // Build order JSON with CORRECT field names (camelCase as per Polymarket API)
         let mut order_json = serde_json::json!({
-            "token_id": order.token_id,
+            "tokenID": order.token_id,  // camelCase, not token_id
             "side": order.side,
             "size": order.size,
             "price": order.price,
             "type": order.order_type,
         });
-        
-        // Add post_only if specified (for maker-only orders)
+
+        // Add postOnly if specified (camelCase, not post_only)
         if let Some(post_only) = order.post_only {
             if post_only {
-                order_json["post_only"] = serde_json::json!(true);
-            }
-        }
-        
-        // Log the order JSON for debugging
-        log::debug!("📋 Order JSON: {}", serde_json::to_string_pretty(&order_json).unwrap_or_default());
-        
-        let mut request = self.client.post(&url).json(&order_json);
-        
-        // Método 1: Signature authentication (EIP-712) - apenas private_key + funder_address
-        if self.auth_method == 1 {
-            if let Some(_) = &self.private_key {
-                let wallet_address = self.wallet_address.as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("funder_address not configured"))?;
-                
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs()
-                    .to_string();
-                
-                let path = "/orders";
-                let order_json_str = serde_json::to_string(&order_json)
-                    .context("Failed to serialize order")?;
-                
-                // Assinar mensagem para EIP-712
-                // Formato: timestamp + método + path + body JSON (sem espaços extras)
-                let message = format!("{}{}{}", timestamp, path, order_json_str);
-                let eip712_signature = self.sign_message(&message)
-                    .context("Failed to sign EIP-712 message")?;
-                
-                log::debug!("📝 Signature message: {}", message);
-                log::debug!("📝 Signature: {}", eip712_signature);
-                
-                // Headers de signature (EIP-712)
-                // Nota: Algumas APIs podem esperar nomes diferentes de headers
-                request = request
-                    .header("X-Wallet-Address", wallet_address)
-                    .header("X-Signature", &eip712_signature)
-                    .header("X-Timestamp", &timestamp)
-                    .header("Content-Type", "application/json");
-                
-                let signer_address = self.derive_signer_address()
-                    .context("Failed to derive signer address")?;
-                
-                log::info!("🔐 Auth: EIP-712 (private_key + funder_address)");
-                log::info!("   Signer: {}, Funder: {}", signer_address, wallet_address);
-                log::info!("   Headers: X-Wallet-Address={}, X-Timestamp={}", wallet_address, timestamp);
-                log::info!("   ℹ️  Usando autenticação EIP-712 - ordens assinadas on-chain");
-                log::info!("   ⚠️  Certifique-se de que o funder_address tem allowance para o Exchange contract");
-                
-                log::info!("📤 Placing LIMIT order: token_id={}, side={}, price={}, size={}, post_only={:?}", 
-                          order.token_id, order.side, order.price, order.size, order.post_only);
-            } else {
-                anyhow::bail!("Auth method is set to signature (1) but private_key is not configured");
-            }
-        } else {
-            // Método 0: Autenticação por API Key (Bearer token)
-            if let Some(key) = &self.api_key {
-                request = request.header("Authorization", format!("Bearer {}", key));
-            } else {
-                anyhow::bail!("Auth method is set to API key (0) but api_key is not configured");
+                order_json["postOnly"] = serde_json::json!(true);
             }
         }
 
-        // Log request details for debugging
-        log::debug!("🌐 Request URL: {}", url);
-        log::debug!("🌐 Request headers: X-Wallet-Address, X-Signature, X-Timestamp");
-        
-        let response = request
-            .send()
-            .await
-            .context("Failed to place order")?;
-        
-        // Log response status and headers
+        // Serialize order to JSON string for HMAC signing
+        let order_body = serde_json::to_string(&order_json)
+            .context("Failed to serialize order")?;
+
+        log::debug!("📋 Order JSON: {}", serde_json::to_string_pretty(&order_json).unwrap_or_default());
+
+        // Timestamp for authentication
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string();
+
+        // CRITICAL: Use API Key authentication (L2) with POLY_* headers
+        // This is the ONLY supported method for POST /order
+        if self.auth_method == 0 {
+            // API Key (L2) authentication - HMAC-SHA256
+            let api_key = self.api_key.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("API key not configured. Run derive_api_keys.rs first!"))?;
+            let api_secret = self.api_secret.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("API secret not configured. Run derive_api_keys.rs first!"))?;
+            let api_passphrase = self.api_passphrase.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("API passphrase not configured. Run derive_api_keys.rs first!"))?;
+
+            // Generate HMAC signature with correct format
+            let method = "POST";
+            let path = "/order";
+            let hmac_signature = self.generate_hmac_signature_l2(&timestamp, method, path, &order_body, api_secret)?;
+
+            log::info!("🔐 Auth: L2 API Key (HMAC-SHA256)");
+            log::info!("   API Key: {}...{}", &api_key[..8.min(api_key.len())], &api_key[api_key.len().saturating_sub(4)..]);
+            log::info!("📤 Placing LIMIT order: tokenID={}, side={}, price={}, size={}, postOnly={:?}",
+                      order.token_id, order.side, order.price, order.size, order.post_only);
+
+            // Build request with POLY_* headers (CRITICAL: not X-* or CLOB_*)
+            let response = self.client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .header("POLY_API_KEY", api_key)
+                .header("POLY_PASSPHRASE", api_passphrase)
+                .header("POLY_SIGNATURE", &hmac_signature)
+                .header("POLY_TIMESTAMP", &timestamp)
+                .body(order_body)
+                .send()
+                .await
+                .context("Failed to place order")?;
+
+            return self.handle_order_response(response, is_production).await;
+
+        } else {
+            // auth_method == 1: L1 signature (EIP-712)
+            // NOTE: L1 auth is more complex and may not work for all orders
+            // Recommended to use L2 API keys for order submission
+            log::warn!("⚠️  Using L1 signature auth. Consider using L2 API keys (auth_method=0) for better reliability.");
+
+            let wallet_address = self.wallet_address.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("funder_address not configured"))?;
+
+            // For L1 auth, we need to sign the order with EIP-712
+            let nonce = uuid::Uuid::new_v4().to_string();
+
+            // Create EIP-712 signature
+            let message = format!("{}POST/order{}", timestamp, order_body);
+            let eip712_signature = self.sign_message(&message)
+                .context("Failed to sign EIP-712 message")?;
+
+            log::info!("🔐 Auth: L1 EIP-712 Signature");
+            log::info!("   Address: {}", wallet_address);
+            log::info!("📤 Placing LIMIT order: tokenID={}, side={}, price={}, size={}, postOnly={:?}",
+                      order.token_id, order.side, order.price, order.size, order.post_only);
+
+            // L1 headers use POLY_* format
+            let response = self.client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .header("POLY_ADDRESS", wallet_address)
+                .header("POLY_SIGNATURE", &eip712_signature)
+                .header("POLY_TIMESTAMP", &timestamp)
+                .header("POLY_NONCE", &nonce)
+                .body(order_body)
+                .send()
+                .await
+                .context("Failed to place order")?;
+
+            return self.handle_order_response(response, is_production).await;
+        }
+    }
+
+    /// Handle order response and extract result
+    async fn handle_order_response(&self, response: reqwest::Response, is_production: bool) -> Result<OrderResponse> {
         log::debug!("📥 Response status: {}", response.status());
         log::debug!("📥 Response headers: {:?}", response.headers());
 
         let status_code = response.status().as_u16();
-        
+
         // Capture raw response text for debugging
         let response_text = response.text().await
             .context("Failed to read response body")?;
-        
+
         // HARD STOP: Se receber 401 em produção, parar o bot imediatamente
         if status_code == 401 && is_production {
             log::error!("❌ CRITICAL: 401 Unauthorized");
@@ -433,13 +455,13 @@ impl PolymarketApi {
             log::error!("🛑 STOPPING BOT to prevent spam and rate limiting.");
             log::error!("");
             log::error!("Possíveis causas:");
-            log::error!("  - Assinatura EIP-712 inválida ou formato incorreto");
-            log::error!("  - funder_address não tem allowance para o Exchange contract");
-            log::error!("  - private_key não corresponde ao signer esperado");
-            log::error!("  - API não aceita autenticação apenas com EIP-712");
+            log::error!("  - API credentials inválidas (api_key, api_secret, api_passphrase)");
+            log::error!("  - Credentials expiradas - execute derive_api_keys.rs novamente");
+            log::error!("  - HMAC signature incorreta");
+            log::error!("  - Headers incorretos (devem ser POLY_*, não X-* ou CLOB_*)");
             std::process::exit(1);
         }
-        
+
         // Tratar erros ANTES de tentar parsear como OrderResponse
         if status_code >= 400 {
             // Tentar parsear como ApiError primeiro
@@ -449,7 +471,7 @@ impl PolymarketApi {
             // Se não for JSON de erro, retornar o texto bruto
             anyhow::bail!("CLOB API error ({}): {}", status_code, response_text);
         }
-        
+
         // Se status é sucesso, tentar parsear como OrderResponse
         let order_response: OrderResponse = serde_json::from_str(&response_text)
             .context(format!("Failed to parse order response. Status: {}, Body: {}", status_code, response_text))?;
@@ -579,24 +601,56 @@ impl PolymarketApi {
     }
 
     /// Generate HMAC signature for API key authentication (similar to TypeScript ClobClient)
+    /// NOTE: This is the OLD method - use generate_hmac_signature_l2 for correct L2 auth
     fn generate_hmac_signature(&self, timestamp: &str, method: &str, path: &str, body: &str) -> Result<String> {
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
         use base64::{Engine as _, engine::general_purpose};
-        
+
         let secret = self.api_secret.as_ref()
             .ok_or_else(|| anyhow::anyhow!("API secret not configured"))?;
-        
+
         // Create message to sign: timestamp + method + path + body
         let message = format!("{}{}{}{}", timestamp, method, path, body);
-        
+
         // Create HMAC-SHA256
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
             .context("Failed to create HMAC")?;
         mac.update(message.as_bytes());
         let result = mac.finalize();
         let signature = general_purpose::STANDARD.encode(result.into_bytes());
-        
+
+        Ok(signature)
+    }
+
+    /// Generate HMAC signature for L2 API key authentication
+    /// CRITICAL: The secret must be base64 DECODED before use as HMAC key!
+    /// Message format: timestamp + method + path + body
+    fn generate_hmac_signature_l2(&self, timestamp: &str, method: &str, path: &str, body: &str, secret: &str) -> Result<String> {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        use base64::{Engine as _, engine::general_purpose};
+
+        // CRITICAL: The API secret is base64-encoded, we must decode it first!
+        let secret_bytes = general_purpose::STANDARD.decode(secret)
+            .context("Failed to decode API secret from base64. Ensure it's valid base64.")?;
+
+        // Create message to sign: timestamp + method + path + body
+        let message = format!("{}{}{}{}", timestamp, method, path, body);
+
+        log::debug!("HMAC message: {}", message);
+
+        // Create HMAC-SHA256 using the DECODED secret bytes
+        let mut mac = Hmac::<Sha256>::new_from_slice(&secret_bytes)
+            .context("Failed to create HMAC")?;
+        mac.update(message.as_bytes());
+        let result = mac.finalize();
+
+        // Encode the signature as base64
+        let signature = general_purpose::STANDARD.encode(result.into_bytes());
+
+        log::debug!("HMAC signature: {}", signature);
+
         Ok(signature)
     }
 
@@ -634,23 +688,26 @@ impl PolymarketApi {
                 // API Key Credentials (HMAC authentication)
                 let api_key = self.api_key.as_ref()
                     .ok_or_else(|| anyhow::anyhow!("API key not configured"))?;
+                let api_secret = self.api_secret.as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("API secret not configured"))?;
                 let passphrase = self.api_passphrase.as_ref()
                     .ok_or_else(|| anyhow::anyhow!("API passphrase not configured"))?;
-                
+
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_secs()
                     .to_string();
-                
-                let signature = self.generate_hmac_signature(&timestamp, method, path, body)?;
-                
-                // Use headers similar to TypeScript ClobClient
+
+                // Use corrected HMAC signature with base64-decoded secret
+                let signature = self.generate_hmac_signature_l2(&timestamp, method, path, body, api_secret)?;
+
+                // CRITICAL: Use POLY_* headers, NOT CLOB_*
                 request = request
-                    .header("CLOB_API_KEY", api_key)
-                    .header("CLOB_PASSPHRASE", passphrase)
-                    .header("CLOB_SIGNATURE", &signature)
-                    .header("CLOB_TIMESTAMP", &timestamp);
+                    .header("POLY_API_KEY", api_key)
+                    .header("POLY_PASSPHRASE", passphrase)
+                    .header("POLY_SIGNATURE", &signature)
+                    .header("POLY_TIMESTAMP", &timestamp);
             } else {
                 // Signature authentication (auth_method = 1)
                 // Note: Some endpoints may only support API Key auth, not signature
