@@ -3,3 +3,7 @@
 Cargo.lock
 config.json
 *.log
+.env
+.env.market
+__pycache__/
+*.pyc
