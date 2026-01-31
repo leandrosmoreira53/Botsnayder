@@ -92,36 +92,92 @@ def find_latest_btc_market(slug_prefix="btc"):
     return None, None
 
 
-def get_market_tokens(condition_id):
+def get_market_tokens(condition_id, gamma_market=None):
     """
-    Obtem os tokens (YES e NO) de um mercado via CLOB API
+    Obtem os tokens (Up e Down) de um mercado.
+    Tenta primeiro via CLOB API, fallback para tokens da Gamma API.
+
+    IMPORTANTE: Esses mercados usam outcomes "Up"/"Down", NAO "Yes"/"No".
     """
+    # Fonte 1: CLOB API
     try:
         resp = requests.get(f"{CLOB_API_URL}/markets/{condition_id}", timeout=10)
-        if resp.status_code != 200:
-            print(f"   Erro ao buscar mercado: status {resp.status_code}")
-            return None, None
-
-        data = resp.json()
-        tokens = data.get("tokens", [])
-
-        if not tokens:
-            print(f"   Nenhum token encontrado no mercado")
-            return None, None
-
-        yes_token = None
-        no_token = None
-
-        for token in tokens:
-            outcome = token.get("outcome", "").upper()
-            if outcome == "YES":
-                yes_token = token
-            elif outcome == "NO":
-                no_token = token
-
-        return yes_token, no_token
+        if resp.status_code == 200:
+            data = resp.json()
+            tokens = data.get("tokens", [])
+            if tokens:
+                print(f"   Tokens da CLOB API ({len(tokens)}):")
+                for t in tokens:
+                    tid = t.get("token_id") or t.get("tokenId")
+                    outcome = t.get("outcome", "?")
+                    print(f"      outcome={outcome} token_id={tid}")
+                up_token, down_token = _extract_tokens(tokens)
+                if up_token and down_token:
+                    return up_token, down_token
     except Exception as e:
-        print(f"   Erro ao obter tokens: {e}")
+        print(f"   Aviso: CLOB API falhou: {e}")
+
+    # Fonte 2: Gamma API (tokens ja vieram no market object)
+    if gamma_market:
+        tokens = gamma_market.get("tokens", [])
+        if tokens:
+            print(f"   Tokens da Gamma API ({len(tokens)}):")
+            for t in tokens:
+                tid = t.get("token_id") or t.get("tokenId")
+                outcome = t.get("outcome", "?")
+                print(f"      outcome={outcome} token_id={tid}")
+            up_token, down_token = _extract_tokens(tokens)
+            if up_token and down_token:
+                return up_token, down_token
+
+    # Fonte 3: clobTokenIds + outcomes do market da Gamma API
+    if gamma_market:
+        try:
+            import json
+            clob_ids_raw = gamma_market.get("clobTokenIds", "[]")
+            outcomes_raw = gamma_market.get("outcomes", "[]")
+            clob_ids = json.loads(clob_ids_raw) if isinstance(clob_ids_raw, str) else clob_ids_raw
+            outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+
+            if clob_ids and outcomes and len(clob_ids) == len(outcomes):
+                print(f"   Tokens de clobTokenIds/outcomes:")
+                tokens = []
+                for tid, outcome in zip(clob_ids, outcomes):
+                    print(f"      outcome={outcome} token_id={tid}")
+                    tokens.append({"token_id": tid, "outcome": outcome})
+                up_token, down_token = _extract_tokens(tokens)
+                if up_token and down_token:
+                    return up_token, down_token
+        except Exception as e:
+            print(f"   Aviso: fallback clobTokenIds falhou: {e}")
+
+    print("   Nenhum token Up/Down encontrado em nenhuma fonte")
+    return None, None
+
+
+def _extract_tokens(tokens):
+    """
+    Extrai tokens Up e Down de uma lista de tokens.
+    Suporta outcomes: Up/Down, Yes/No (case-insensitive).
+    Se houver exatamente 2 tokens sem outcome reconhecido, usa posicao [0]=Up, [1]=Down.
+    """
+    up_token = None
+    down_token = None
+
+    for token in tokens:
+        outcome = token.get("outcome", "").strip().upper()
+        if outcome in ("UP", "YES"):
+            up_token = token
+        elif outcome in ("DOWN", "NO"):
+            down_token = token
+
+    # Fallback: se tem exatamente 2 tokens e nao achou por nome, usa posicao
+    if not up_token and not down_token and len(tokens) == 2:
+        print("   (usando posicao: [0]=Up, [1]=Down)")
+        up_token = tokens[0]
+        down_token = tokens[1]
+
+    return up_token, down_token
         import traceback
         traceback.print_exc()
         return None, None
@@ -181,7 +237,7 @@ def main():
     INTERVAL_MINUTES = int(os.getenv("TRADE_INTERVAL_MINUTES", "15"))
     ORDER_PRICE = float(os.getenv("ORDER_PRICE", "0.50"))
     ORDER_SIZE = float(os.getenv("ORDER_SIZE", "10.0"))
-    TOKEN_SIDE = os.getenv("TOKEN_SIDE", "YES").upper()
+    TOKEN_SIDE = os.getenv("TOKEN_SIDE", "UP").upper()  # UP ou DOWN
     TRADE_ENABLED = os.getenv("AUTO_TRADE_ENABLED", "true").lower() == "true"
 
     if not PRIVATE_KEY:
@@ -245,34 +301,34 @@ def main():
                 print("Novo mercado detectado!")
                 last_market_condition_id = condition_id
 
-                # Obtem os tokens
+                # Obtem os tokens (Up e Down)
                 print("\nObtendo tokens do mercado...")
-                yes_token, no_token = get_market_tokens(condition_id)
+                up_token, down_token = get_market_tokens(condition_id, gamma_market=market)
 
-                if not yes_token or not no_token:
+                if not up_token or not down_token:
                     print("Nao foi possivel obter tokens. Pulando este mercado...")
                     time.sleep(INTERVAL_MINUTES * 60)
                     continue
 
-                yes_id = yes_token.get("token_id") or yes_token.get("tokenId")
-                no_id = no_token.get("token_id") or no_token.get("tokenId")
+                up_id = up_token.get("token_id") or up_token.get("tokenId")
+                down_id = down_token.get("token_id") or down_token.get("tokenId")
 
                 print(f"Tokens encontrados:")
-                print(f"   YES Token ID: {yes_id}")
-                print(f"   NO Token ID: {no_id}")
+                print(f"   UP   Token ID: {up_id}")
+                print(f"   DOWN Token ID: {down_id}")
 
                 # Obtem precos atuais
-                yes_price = get_price(yes_id, "BUY")
-                no_price = get_price(no_id, "BUY")
-                if yes_price is not None and no_price is not None:
+                up_price = get_price(up_id, "BUY")
+                down_price = get_price(down_id, "BUY")
+                if up_price is not None and down_price is not None:
                     print(f"\nPrecos atuais:")
-                    print(f"   YES: ${yes_price:.4f}")
-                    print(f"   NO:  ${no_price:.4f}")
-                    print(f"   Total: ${yes_price + no_price:.4f}")
+                    print(f"   UP:   ${up_price:.4f}")
+                    print(f"   DOWN: ${down_price:.4f}")
+                    print(f"   Total: ${up_price + down_price:.4f}")
 
                 # Executa trade se habilitado
                 if TRADE_ENABLED:
-                    target_token = yes_token if TOKEN_SIDE == "YES" else no_token
+                    target_token = up_token if TOKEN_SIDE in ("UP", "YES") else down_token
                     token_id = target_token.get("token_id") or target_token.get("tokenId")
 
                     print(f"\nPreparando ordem {TOKEN_SIDE}...")
