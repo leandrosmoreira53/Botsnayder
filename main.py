@@ -26,10 +26,13 @@ from typing import Optional
 
 from execution import PolymarketClient, OrderBook
 from strategies.gabagool_paircost_mm import (
+    AccumulationMode,
     GabagoolPairCostMMStrategy,
     MarketState,
     Phase,
     StrategyConfig,
+    TrustScore,
+    compute_trust_score,
     current_phase,
 )
 
@@ -103,6 +106,27 @@ async def discover_markets(
             if not yes_tid or not no_tid:
                 log.warning("Market %s missing YES/NO tokens, skip", slug)
                 continue
+
+            # Pre-check book quality (Trust Scoring)
+            try:
+                yb, nb = await asyncio.gather(
+                    client.get_orderbook(yes_tid),
+                    client.get_orderbook(no_tid),
+                )
+                ts_obj = compute_trust_score(yb, nb, StrategyConfig())
+                if ts_obj.score < 0.3:
+                    log.info(
+                        "Market %s rejected by trust score: %.2f (%s)",
+                        slug, ts_obj.score, ts_obj.reason,
+                    )
+                    continue
+                log.info(
+                    "Market %s trust score: %.2f (%s) depth=$%.0f+$%.0f",
+                    slug, ts_obj.score, ts_obj.reason,
+                    ts_obj.depth_yes_usd, ts_obj.depth_no_usd,
+                )
+            except Exception as exc:
+                log.warning("Trust pre-check failed for %s: %s", slug, exc)
 
             # Estimate end_epoch from slug timestamp + 15 min
             end_epoch = float(ts + PERIOD_SECS)

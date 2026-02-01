@@ -41,6 +41,23 @@
     "phase_c_start": 180,
     "phase_d_start": 60,
     "max_imbalance_ratio": 3.0,
-    "unpaired_max_usd": 10.0
+    "unpaired_max_usd": 10.0,
+
+    "_comment_trust": "Trust Scoring (Point 6) - market quality filter",
+    "trust_min_book_depth_usd": 50.0,
+    "trust_max_spread": 0.08,
+    "trust_min_levels": 2,
+    "trust_score_threshold": 0.4,
+
+    "_comment_exposure": "Exposure Curve (Point 6) - cost/payout health ratio",
+    "exposure_ratio_max": 0.95,
+
+    "_comment_mispricing": "Mispricing Intensity (Point 1) - proportional sizing",
+    "mispricing_size_boost_max": 2.0,
+    "mispricing_base_threshold": 0.02,
+
+    "_comment_accum": "Accumulation Mode (Point 3) - asymmetric temporal buying",
+    "accum_imbalance_trigger": 1.5,
+    "accum_cheapness_threshold": 0.45
   }
 }
