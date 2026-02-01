@@ -23,41 +23,62 @@
     "price_improvement_pct": 0.1
   },
   "strategy": {
+    "_comment_pair_cost": "RF-03/RF-04: Pair cost engine - core profit mechanism",
     "pair_cost_target": 0.99,
-    "lock_profit_usd": 0.005,
+    "pair_cost_improvement_min": 0.002,
+    "lock_profit_usd": 0.05,
     "min_lock_shares": 5.0,
+
+    "_comment_bootstrap": "RF-05: Bootstrap limits when one side is zero",
+    "bootstrap_max_usd": 8.0,
+    "bootstrap_max_shares": 10.0,
+
+    "_comment_sizing": "RF-11: Position sizing and bankroll limits",
     "bankroll": 100.0,
     "max_usd_per_market": 25.0,
-    "max_usd_per_side": 15.0,
+    "max_usd_per_side": 12.5,
     "min_shares": 5,
+
+    "_comment_quoting": "RF-07: Quote generation (maker MM ladder)",
     "edge_min": 0.01,
     "edge_max": 0.05,
     "levels": 3,
     "level_spacing": 0.005,
-    "reprice_threshold": 0.005,
-    "lost_top_ms": 3000,
+
+    "_comment_antichurn": "RF-10: Cancel/replace anti-churn controls",
+    "reprice_threshold": 0.01,
+    "lost_top_ms": 800,
     "cooldown_ms": 500,
+
+    "_comment_phases": "RF-09: Time phases (seconds remaining before expiry)",
     "phase_b_start": 600,
     "phase_c_start": 180,
     "phase_d_start": 60,
-    "max_imbalance_ratio": 3.0,
-    "unpaired_max_usd": 10.0,
 
-    "_comment_trust": "Trust Scoring (Point 6) - market quality filter",
+    "_comment_inventory": "RF-08: Inventory control / pairing balance",
+    "max_imbalance_ratio": 3.0,
+    "inv_max_imbalance_shares": 20.0,
+
+    "_comment_trust": "RF-01: Trust Scoring - market quality filter",
     "trust_min_book_depth_usd": 50.0,
     "trust_max_spread": 0.08,
     "trust_min_levels": 2,
     "trust_score_threshold": 0.4,
 
-    "_comment_exposure": "Exposure Curve (Point 6) - cost/payout health ratio",
+    "_comment_exposure": "Exposure Curve - cost/payout health ratio gate",
     "exposure_ratio_max": 0.95,
 
-    "_comment_mispricing": "Mispricing Intensity (Point 1) - proportional sizing",
+    "_comment_mispricing": "Mispricing Intensity - proportional sizing boost",
     "mispricing_size_boost_max": 2.0,
     "mispricing_base_threshold": 0.02,
 
-    "_comment_accum": "Accumulation Mode (Point 3) - asymmetric temporal buying",
+    "_comment_accum": "Accumulation Mode - asymmetric temporal buying",
     "accum_imbalance_trigger": 1.5,
-    "accum_cheapness_threshold": 0.45
+    "accum_cheapness_threshold": 0.45,
+
+    "_comment_discovery": "RF-01/RF-12: Discovery, market rotation, and observability",
+    "discovery_interval_s": 20.0,
+    "active_markets": 4,
+    "metrics_interval_s": 5.0
   }
 }
