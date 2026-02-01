@@ -178,9 +178,6 @@ def _extract_tokens(tokens):
         down_token = tokens[1]
 
     return up_token, down_token
-        import traceback
-        traceback.print_exc()
-        return None, None
 
 
 def get_price(token_id, side="BUY"):
