@@ -21,5 +21,26 @@
     "post_only": true,
     "use_market_orders": false,
     "price_improvement_pct": 0.1
+  },
+  "strategy": {
+    "pair_cost_target": 0.99,
+    "lock_profit_usd": 0.005,
+    "min_lock_shares": 5.0,
+    "bankroll": 100.0,
+    "max_usd_per_market": 25.0,
+    "max_usd_per_side": 15.0,
+    "min_shares": 5,
+    "edge_min": 0.01,
+    "edge_max": 0.05,
+    "levels": 3,
+    "level_spacing": 0.005,
+    "reprice_threshold": 0.005,
+    "lost_top_ms": 3000,
+    "cooldown_ms": 500,
+    "phase_b_start": 600,
+    "phase_c_start": 180,
+    "phase_d_start": 60,
+    "max_imbalance_ratio": 3.0,
+    "unpaired_max_usd": 10.0
   }
 }
