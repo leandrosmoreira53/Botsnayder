@@ -6,10 +6,18 @@ Loads config.json (same file used by the Rust bot), discovers up to N
 15-minute markets, and runs the GabagoolPairCostMMStrategy in a continuous
 async loop.
 
+Low-latency optimizations (supersnayder model):
+    FASE 1: Connection pooling (TCPConnector) via execution.py
+    FASE 4: SenderTask pipeline (non-blocking order submission)
+    FASE 5: ReconcileTask (fill detection off hot path)
+    FASE 7: uvloop on Linux (faster event loop)
+    FASE 3: Conditional logging via --verbose flag
+
 Usage:
     python main.py                       # production
     python main.py --simulation          # dry-run, no real orders
     python main.py --config other.json   # custom config file
+    python main.py --verbose             # enable hot-path logging
 
 Spec coverage:
     RF-01  Market Discovery      discover_markets + trust pre-check
@@ -23,13 +31,32 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import logging
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+# FASE 7: uvloop on Linux for faster event loop
+if sys.platform == "linux":
+    try:
+        import uvloop
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    except ImportError:
+        pass
+
+# FASE 6: orjson for config loading
+try:
+    import orjson
+
+    def _load_json(path: str) -> dict:
+        return orjson.loads(Path(path).read_bytes())
+except ImportError:
+    import json as _json
+
+    def _load_json(path: str) -> dict:
+        return _json.loads(Path(path).read_text())
 
 from execution import PolymarketClient, OrderBook
 from strategies.gabagool_paircost_mm import (
@@ -43,6 +70,10 @@ from strategies.gabagool_paircost_mm import (
     compute_trust_score,
     current_phase,
 )
+from poly_data import global_state as gstate
+from poly_data.sender_task import SenderTask
+from poly_data.reconcile_task import ReconcileTask
+from poly_data.order_intent import OrderIntentFP
 
 log = logging.getLogger("gabagool")
 
@@ -100,14 +131,16 @@ async def discover_markets(
                 continue
 
             if not details.accepting_orders:
-                log.info("Market %s not accepting orders, skip", slug)
+                if gstate._VERBOSE:
+                    log.info("Market %s not accepting orders, skip", slug)
                 continue
 
             # RF-01: time remaining filter
             end_epoch = float(ts + PERIOD_SECS)
             secs_left = end_epoch - now
             if secs_left < strat_cfg.phase_d_start:
-                log.info("Market %s too close to expiry (%.0fs), skip", slug, secs_left)
+                if gstate._VERBOSE:
+                    log.info("Market %s too close to expiry (%.0fs), skip", slug, secs_left)
                 continue
 
             # Identify YES (Up) and NO (Down) tokens
@@ -131,16 +164,16 @@ async def discover_markets(
                 )
                 ts_obj = compute_trust_score(yb, nb, strat_cfg)
                 if ts_obj.score < 0.3:
-                    log.info(
-                        "Market %s rejected by trust score: %.2f (%s)",
-                        slug, ts_obj.score, ts_obj.reason,
-                    )
+                    if gstate._VERBOSE:
+                        log.info(
+                            "Market %s rejected by trust score: %.2f (%s)",
+                            slug, ts_obj.score, ts_obj.reason,
+                        )
                     continue
                 log.info(
-                    "Market %s trust score: %.2f (%s) depth=$%.0f+$%.0f spread_y=%.4f spread_n=%.4f",
-                    slug, ts_obj.score, ts_obj.reason,
+                    "Market %s trust=%.2f depth=$%.0f+$%.0f",
+                    slug, ts_obj.score,
                     ts_obj.depth_yes_usd, ts_obj.depth_no_usd,
-                    ts_obj.spread_yes, ts_obj.spread_no,
                 )
             except Exception as exc:
                 log.warning("Trust pre-check failed for %s: %s", slug, exc)
@@ -166,39 +199,6 @@ async def discover_markets(
 
 
 # ---------------------------------------------------------------------------
-# Fill detection (poll-based) -- RNF-02 dedup via fill_id
-# ---------------------------------------------------------------------------
-
-async def poll_fills(
-    client: PolymarketClient,
-    strategy: GabagoolPairCostMMStrategy,
-    ms: MarketState,
-):
-    """
-    Compare live_orders snapshot vs open_orders to detect fills.
-    Uses order_id as fill_id for RNF-02 deduplication.
-    """
-    try:
-        open_orders = await client.get_open_orders(market=ms.condition_id)
-    except Exception:
-        return
-
-    open_ids = {o.get("id") or o.get("order_id") for o in open_orders}
-
-    filled_ids = [oid for oid in list(ms.live_orders) if oid not in open_ids]
-
-    for oid in filled_ids:
-        order = ms.live_orders.pop(oid, None)
-        if order is None:
-            continue
-        tok_side = "YES" if order.get("token_id") == ms.yes_token_id else "NO"
-        qty = float(order.get("size", 0))
-        px = float(order.get("price", 0))
-        if qty > 0:
-            strategy.on_fill(ms.condition_id, tok_side, qty, px, fill_id=oid)
-
-
-# ---------------------------------------------------------------------------
 # Main loop (one tick per market)
 # ---------------------------------------------------------------------------
 
@@ -207,8 +207,12 @@ async def tick_market(
     strategy: GabagoolPairCostMMStrategy,
     ms: MarketState,
     simulation: bool,
+    sender: Optional[SenderTask] = None,
 ):
-    """Execute one strategy tick for a single market."""
+    """Execute one strategy tick for a single market.
+
+    FASE 4: If sender is provided, order placement is non-blocking via pipeline.
+    """
 
     # RF-06: If locked, just cancel remaining and return
     if ms.locked:
@@ -226,7 +230,7 @@ async def tick_market(
         )
     except Exception as exc:
         # RNF-01: fail-safe on API error
-        log.warning("[%s] book fetch failed: %s -- cancelling orders as precaution",
+        log.warning("[%s] book fetch failed: %s -- cancelling orders",
                     ms.condition_id[:12], exc)
         if ms.live_orders and not simulation:
             try:
@@ -238,18 +242,14 @@ async def tick_market(
 
     strategy.on_book(ms.condition_id, yes_book, no_book)
 
-    # 2. Detect fills (RNF-02: dedup via fill_id)
-    await poll_fills(client, strategy, ms)
-
-    # 3. RF-12: Log metrics (respects metrics_interval_s)
+    # 2. RF-12: Log metrics (respects metrics_interval_s)
     strategy.log_metrics(ms)
 
-    # 4. RF-06: Check lock-profit after fills
+    # 3. RF-06: Check lock-profit after fills
     if strategy.should_lock_profit(ms):
         ms.locked = True
         log.info(
-            "LOCK PROFIT [%s] profit_floor=$%.4f payout_floor=%.2f -- "
-            "cancelling all orders",
+            "LOCK PROFIT [%s] profit_floor=$%.4f payout_floor=%.2f",
             ms.condition_id[:12], ms.pcs.profit_floor, ms.pcs.payout_floor,
         )
         if ms.live_orders and not simulation:
@@ -257,7 +257,7 @@ async def tick_market(
         ms.live_orders.clear()
         return
 
-    # 5. Phase check
+    # 4. Phase check
     phase = strategy.apply_time_phase(ms)
     if phase == Phase.D:
         if ms.live_orders and not simulation:
@@ -268,65 +268,99 @@ async def tick_market(
     if not strategy.risk_check(ms):
         return
 
-    # 6. RF-07: Compute target quotes
+    # 5. RF-07: Compute target quotes
     intents = strategy.compute_quotes(ms)
 
-    # 7. RF-10: Cancel/replace plan
+    # 6. RF-10: Cancel/replace plan
     cancel_ids, new_intents = strategy.plan_requotes(ms, intents)
 
-    # 8. Execute cancels
+    # 7. Execute cancels
     if cancel_ids and not simulation:
-        cancel_tasks = [client.cancel_order(oid) for oid in cancel_ids]
-        await asyncio.gather(*cancel_tasks, return_exceptions=True)
+        if sender:
+            # FASE 4: Non-blocking cancel via sender pipeline
+            for oid in cancel_ids:
+                sender.submit_cancel(oid)
+        else:
+            cancel_tasks = [client.cancel_order(oid) for oid in cancel_ids]
+            await asyncio.gather(*cancel_tasks, return_exceptions=True)
     for oid in cancel_ids:
         ms.live_orders.pop(oid, None)
 
-    # 9. Place new orders (RNF-01: always post_only=True)
+    # 8. Place new orders (RNF-01: always post_only=True)
     for intent in new_intents:
         # RNF-01: final cross-check -- never buy above best ask
         book = ms.yes_book if intent.token_id == ms.yes_token_id else ms.no_book
         if book and book.best_ask is not None and intent.price >= book.best_ask:
-            log.warning(
-                "[%s] RNF-01 BLOCKED: intent price %.4f >= best_ask %.4f for %s",
-                ms.condition_id[:12], intent.price, book.best_ask, intent.label,
-            )
+            if gstate._VERBOSE:
+                log.warning(
+                    "[%s] RNF-01 BLOCKED: price %.4f >= best_ask %.4f",
+                    ms.condition_id[:12], intent.price, book.best_ask,
+                )
             continue
 
         if simulation:
-            log.info(
-                "[SIM] Would place %s %s %.2f @ %.4f on %s",
-                intent.side, intent.label, intent.size, intent.price,
-                ms.condition_id[:12],
-            )
+            if gstate._VERBOSE:
+                log.info(
+                    "[SIM] %s %s %.2f @ %.4f on %s",
+                    intent.side, intent.label, intent.size, intent.price,
+                    ms.condition_id[:12],
+                )
             continue
 
-        try:
-            resp = await client.place_order(
+        if sender:
+            # FASE 4: Non-blocking submit to sender pipeline
+            intent_fp = OrderIntentFP.from_floats(
                 token_id=intent.token_id,
                 side=intent.side,
-                size=intent.size,
                 price=intent.price,
-                post_only=True,
+                size=intent.size,
+                label=intent.label,
             )
-            if resp.order_id:
-                ms.live_orders[resp.order_id] = {
+            submitted = sender.submit(intent_fp)
+            if submitted:
+                # Track in live_orders (will be reconciled by ReconcileTask)
+                ms.live_orders[f"pending_{intent.label}_{time.monotonic_ns()}"] = {
                     "token_id": intent.token_id,
                     "side": intent.side,
                     "price": intent.price,
                     "size": intent.size,
-                    "placed_ts": time.time() * 1000,  # RF-10: for lost-top tracking
+                    "placed_ts": time.time() * 1000,
                 }
-                log.info(
-                    "Placed %s %s %.2f @ %.4f -> %s",
-                    intent.side, intent.label, intent.size, intent.price,
-                    resp.order_id,
+                if gstate._VERBOSE:
+                    log.info(
+                        "Queued %s %s %.2f @ %.4f",
+                        intent.side, intent.label, intent.size, intent.price,
+                    )
+        else:
+            # Fallback: direct placement (original behavior)
+            try:
+                resp = await client.place_order(
+                    token_id=intent.token_id,
+                    side=intent.side,
+                    size=intent.size,
+                    price=intent.price,
+                    post_only=True,
                 )
-        except RuntimeError as exc:
-            if "401" in str(exc):
-                raise  # propagate auth failure for fail-safe
-            log.error("Order failed for %s: %s", intent.label, exc)
-        except Exception as exc:
-            log.error("Order failed for %s: %s", intent.label, exc)
+                if resp.order_id:
+                    ms.live_orders[resp.order_id] = {
+                        "token_id": intent.token_id,
+                        "side": intent.side,
+                        "price": intent.price,
+                        "size": intent.size,
+                        "placed_ts": time.time() * 1000,
+                    }
+                    if gstate._VERBOSE:
+                        log.info(
+                            "Placed %s %s %.2f @ %.4f -> %s",
+                            intent.side, intent.label, intent.size, intent.price,
+                            resp.order_id,
+                        )
+            except RuntimeError as exc:
+                if "401" in str(exc):
+                    raise
+                log.error("Order failed for %s: %s", intent.label, exc)
+            except Exception as exc:
+                log.error("Order failed for %s: %s", intent.label, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -383,9 +417,12 @@ async def rotate_markets(
 # Entry-point
 # ---------------------------------------------------------------------------
 
-async def run(config_path: str, simulation: bool):
+async def run(config_path: str, simulation: bool, verbose: bool = False):
+    # FASE 3: Set verbose flag for conditional logging
+    gstate.set_verbose(verbose)
+
     # Load config
-    cfg_data = json.loads(Path(config_path).read_text())
+    cfg_data = _load_json(config_path)
     strat_cfg = StrategyConfig.from_dict(cfg_data.get("strategy", {}))
 
     # Override bankroll from trading.max_position_size if present
@@ -396,15 +433,35 @@ async def run(config_path: str, simulation: bool):
     client = PolymarketClient(cfg_data)
     strategy = GabagoolPairCostMMStrategy(strat_cfg, client)
 
+    # FASE 4: Initialize sender pipeline
+    sender: Optional[SenderTask] = None
+    if not simulation:
+        sender = SenderTask(client, batch_size=4, flush_interval_ms=50)
+        gstate.SENDER = sender
+        asyncio.create_task(sender.run())
+        log.info("SenderTask pipeline started (batch=4, flush=50ms)")
+
+    # FASE 5: Initialize reconcile task
+    reconciler: Optional[ReconcileTask] = None
+    if not simulation:
+        reconciler = ReconcileTask(
+            client, strategy,
+            interval_s=max(2.0, strat_cfg.metrics_interval_s),
+        )
+        asyncio.create_task(reconciler.run())
+        log.info("ReconcileTask started (interval=%.1fs)", reconciler._interval_s)
+
     mode = "SIMULATION" if simulation else "PRODUCTION"
     log.info("Starting Gabagool22 Pair-Cost MM Scalper  [%s]", mode)
     log.info(
         "Config: bankroll=$%.2f  pair_cost_target=%.4f  min_shares=%.0f  "
-        "active_markets=%d  discovery_interval=%.0fs  metrics_interval=%.0fs",
+        "active_markets=%d  discovery_interval=%.0fs",
         strat_cfg.bankroll, strat_cfg.pair_cost_target, strat_cfg.min_shares,
         strat_cfg.active_markets, strat_cfg.discovery_interval_s,
-        strat_cfg.metrics_interval_s,
     )
+    log.info("Low-latency: uvloop=%s  orjson=%s  sender=%s  reconcile=%s",
+             "uvloop" in sys.modules, "orjson" in sys.modules,
+             sender is not None, reconciler is not None)
 
     # RNF-01: Never log secrets
     log.info("Auth method: %s  wallet: %s",
@@ -426,7 +483,7 @@ async def run(config_path: str, simulation: bool):
         while True:
             # Tick all active markets concurrently (RNF-03)
             tasks = [
-                tick_market(client, strategy, ms, simulation)
+                tick_market(client, strategy, ms, simulation, sender)
                 for ms in list(strategy.markets.values())
             ]
             if tasks:
@@ -452,6 +509,11 @@ async def run(config_path: str, simulation: bool):
         else:
             raise
     finally:
+        # Graceful shutdown
+        if sender:
+            await sender.stop()
+        if reconciler:
+            await reconciler.stop()
         # RNF-01: Cancel all on exit (fail-safe)
         if not simulation:
             try:
@@ -468,6 +530,8 @@ async def run(config_path: str, simulation: bool):
             cid[:12], ms.pcs.pair_cost, ms.pcs.profit_floor,
             ms.pcs.qty_yes, ms.pcs.qty_no, ms.locked,
         )
+    if sender:
+        log.info("Sender metrics: %s", sender.metrics)
 
 
 def main():
@@ -476,6 +540,8 @@ def main():
                         help="Dry-run mode, no real orders")
     parser.add_argument("--config", "-c", default="config.json",
                         help="Path to config.json (default: config.json)")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Enable verbose hot-path logging (FASE 3)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -484,7 +550,7 @@ def main():
         datefmt="%H:%M:%S",
     )
 
-    asyncio.run(run(args.config, args.simulation))
+    asyncio.run(run(args.config, args.simulation, args.verbose))
 
 
 if __name__ == "__main__":

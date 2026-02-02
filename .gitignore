@@ -5,3 +5,7 @@ config.json
 *.log
 __pycache__/
 *.pyc
+*.so
+build/
+poly_data/*.c
+poly_data/*.so

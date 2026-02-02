@@ -4,37 +4,69 @@ Thin Python CLOB client for Polymarket.
 Mirrors the authentication and order-placement patterns from the existing
 Rust api.rs so that the Python strategy layer talks to the *same* endpoints
 with the *same* credential format (config.json).
+
+Low-latency optimizations (supersnayder model):
+  FASE 1: Connection pooling with keep-alive (TCPConnector)
+  FASE 2: Cached auth headers (base dict reuse)
+  FASE 3: Conditional logging via _VERBOSE
+  FASE 6: orjson serialization (bytes-first), __slots__ on data classes
 """
 
-import asyncio
+from __future__ import annotations
+
 import hashlib
 import hmac
 import base64
-import json
 import time
 import logging
-from dataclasses import dataclass, field
 from typing import Optional
 
 import aiohttp
+
+from poly_data import global_state as gstate
+
+# FASE 6: Prefer orjson for zero-copy bytes serialization
+try:
+    import orjson
+
+    def _dumps(obj: dict) -> bytes:
+        return orjson.dumps(obj, option=orjson.OPT_NON_STR_KEYS)
+
+    def _loads(data):
+        return orjson.loads(data)
+except ImportError:
+    import json as _json
+
+    def _dumps(obj: dict) -> bytes:
+        return _json.dumps(obj, separators=(",", ":")).encode()
+
+    def _loads(data):
+        return _json.loads(data)
+
 
 log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Data-classes (mirror Rust models.rs)
+# Data-classes — FASE 6: __slots__ for hot-path objects
 # ---------------------------------------------------------------------------
 
-@dataclass
 class OrderBookEntry:
-    price: float
-    size: float
+    """Single price level. __slots__ for reduced per-instance overhead."""
+    __slots__ = ("price", "size")
+
+    def __init__(self, price: float, size: float):
+        self.price = price
+        self.size = size
 
 
-@dataclass
 class OrderBook:
-    bids: list[OrderBookEntry] = field(default_factory=list)
-    asks: list[OrderBookEntry] = field(default_factory=list)
+    """Parsed orderbook with best-price accessors. __slots__."""
+    __slots__ = ("bids", "asks")
+
+    def __init__(self, bids=None, asks=None):
+        self.bids: list[OrderBookEntry] = bids or []
+        self.asks: list[OrderBookEntry] = asks or []
 
     @property
     def best_bid(self) -> Optional[float]:
@@ -51,24 +83,49 @@ class OrderBook:
         return self.best_bid or self.best_ask
 
 
-@dataclass
 class OrderResponse:
-    order_id: Optional[str] = None
-    status: str = ""
-    message: Optional[str] = None
+    """API response for order placement. __slots__."""
+    __slots__ = ("order_id", "status", "message")
+
+    def __init__(
+        self,
+        order_id: Optional[str] = None,
+        status: str = "",
+        message: Optional[str] = None,
+    ):
+        self.order_id = order_id
+        self.status = status
+        self.message = message
 
 
-@dataclass
 class MarketInfo:
-    condition_id: str = ""
-    slug: str = ""
-    active: bool = False
-    closed: bool = False
-    accepting_orders: bool = False
-    minimum_order_size: float = 5.0
-    minimum_tick_size: float = 0.01
-    end_date_iso: str = ""
-    tokens: list[dict] = field(default_factory=list)
+    """Market metadata from CLOB API. __slots__."""
+    __slots__ = (
+        "condition_id", "slug", "active", "closed", "accepting_orders",
+        "minimum_order_size", "minimum_tick_size", "end_date_iso", "tokens",
+    )
+
+    def __init__(
+        self,
+        condition_id: str = "",
+        slug: str = "",
+        active: bool = False,
+        closed: bool = False,
+        accepting_orders: bool = False,
+        minimum_order_size: float = 5.0,
+        minimum_tick_size: float = 0.01,
+        end_date_iso: str = "",
+        tokens: Optional[list] = None,
+    ):
+        self.condition_id = condition_id
+        self.slug = slug
+        self.active = active
+        self.closed = closed
+        self.accepting_orders = accepting_orders
+        self.minimum_order_size = minimum_order_size
+        self.minimum_tick_size = minimum_tick_size
+        self.end_date_iso = end_date_iso
+        self.tokens = tokens or []
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +133,13 @@ class MarketInfo:
 # ---------------------------------------------------------------------------
 
 class PolymarketClient:
-    """Async Python wrapper around the Polymarket CLOB REST API."""
+    """Async Python wrapper around the Polymarket CLOB REST API.
+
+    Low-latency:
+      FASE 1: TCPConnector with connection pooling + keep-alive
+      FASE 2: Cached base auth headers (shallow copy per request)
+      FASE 6: orjson for JSON serialization (bytes-first)
+    """
 
     def __init__(self, config: dict):
         pm = config["polymarket"]
@@ -90,12 +153,30 @@ class PolymarketClient:
         self.wallet_address: Optional[str] = pm.get("funder_address")
         self._session: Optional[aiohttp.ClientSession] = None
 
+        # FASE 2: Pre-build base auth headers (static fields cached)
+        self._base_headers: dict = {
+            "POLY_API_KEY": self.api_key or "",
+            "POLY_PASSPHRASE": self.api_passphrase or "",
+            "Content-Type": "application/json",
+            "Connection": "keep-alive",
+        }
+
     # -- lifecycle -----------------------------------------------------------
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
+            # FASE 1: Connection pooling with keep-alive
+            connector = aiohttp.TCPConnector(
+                limit=20,
+                keepalive_timeout=30,
+                enable_cleanup_closed=True,
+            )
             timeout = aiohttp.ClientTimeout(total=10)
-            self._session = aiohttp.ClientSession(timeout=timeout)
+            self._session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=timeout,
+                headers={"Connection": "keep-alive"},
+            )
         return self._session
 
     async def close(self):
@@ -111,15 +192,13 @@ class PolymarketClient:
         return base64.b64encode(sig).decode()
 
     def _auth_headers(self, method: str, path: str, body: str = "") -> dict:
+        """Build auth headers. FASE 2: Shallow copy of cached base dict."""
         ts = str(int(time.time()))
         sig = self._hmac_signature(ts, method, path, body)
-        return {
-            "POLY_API_KEY": self.api_key,
-            "POLY_PASSPHRASE": self.api_passphrase,
-            "POLY_SIGNATURE": sig,
-            "POLY_TIMESTAMP": ts,
-            "Content-Type": "application/json",
-        }
+        h = self._base_headers.copy()  # reuse cached static fields
+        h["POLY_SIGNATURE"] = sig
+        h["POLY_TIMESTAMP"] = ts
+        return h
 
     # -- public endpoints (no auth needed) -----------------------------------
 
@@ -128,10 +207,25 @@ class PolymarketClient:
         url = f"{self.clob_url}/book"
         async with session.get(url, params={"token_id": token_id}) as resp:
             resp.raise_for_status()
-            data = await resp.json()
+            # FASE 6: orjson loads from bytes (avoids decode step)
+            raw = await resp.read()
+            data = _loads(raw)
         bids = [OrderBookEntry(float(e["price"]), float(e["size"])) for e in data.get("bids", [])]
         asks = [OrderBookEntry(float(e["price"]), float(e["size"])) for e in data.get("asks", [])]
         return OrderBook(bids=bids, asks=asks)
+
+    async def get_book_snapshot(self, token_id: str):
+        """FASE 5: Returns ImmutableBookSnapshot directly (avoids OrderBook alloc)."""
+        from poly_data.book_state import ImmutableBookSnapshot
+        session = await self._get_session()
+        url = f"{self.clob_url}/book"
+        async with session.get(url, params={"token_id": token_id}) as resp:
+            resp.raise_for_status()
+            raw = await resp.read()
+            data = _loads(raw)
+        return ImmutableBookSnapshot.from_raw(
+            data.get("bids", []), data.get("asks", []),
+        )
 
     async def get_market_by_slug(self, slug: str) -> Optional[dict]:
         session = await self._get_session()
@@ -139,7 +233,8 @@ class PolymarketClient:
         async with session.get(url) as resp:
             if resp.status != 200:
                 return None
-            data = await resp.json()
+            raw = await resp.read()
+            data = _loads(raw)
         markets = data.get("markets", [])
         return markets[0] if markets else None
 
@@ -148,7 +243,8 @@ class PolymarketClient:
         url = f"{self.clob_url}/markets/{condition_id}"
         async with session.get(url) as resp:
             resp.raise_for_status()
-            data = await resp.json()
+            raw = await resp.read()
+            data = _loads(raw)
         return MarketInfo(
             condition_id=data.get("condition_id", ""),
             slug=data.get("market_slug", ""),
@@ -183,7 +279,7 @@ class PolymarketClient:
         path = "/order"
         url = f"{self.clob_url}{path}"
 
-        order_json: dict = {
+        order_dict: dict = {
             "tokenID": token_id,
             "side": side,
             "size": str(size),
@@ -191,30 +287,57 @@ class PolymarketClient:
             "type": "LIMIT",
         }
         if post_only:
-            order_json["postOnly"] = True
+            order_dict["postOnly"] = True
 
-        body = json.dumps(order_json, separators=(",", ":"))
-        headers = self._auth_headers("POST", path, body)
+        # FASE 6: orjson serialization (bytes)
+        body_bytes = _dumps(order_dict)
+        body_str = body_bytes.decode()
+        headers = self._auth_headers("POST", path, body_str)
 
-        log.info(
-            "place_order  token=%s side=%s size=%.4f price=%.4f postOnly=%s",
-            token_id, side, size, price, post_only,
-        )
+        if gstate._VERBOSE:
+            log.info(
+                "place_order  token=%s side=%s size=%.4f price=%.4f postOnly=%s",
+                token_id[:16], side, size, price, post_only,
+            )
 
         session = await self._get_session()
-        async with session.post(url, headers=headers, data=body) as resp:
+        async with session.post(url, headers=headers, data=body_bytes) as resp:
             status = resp.status
-            text = await resp.text()
+            raw = await resp.read()
 
             if status == 401:
-                log.error("401 Unauthorized placing order. Check L2 credentials. Body: %s", text)
+                log.error("401 Unauthorized placing order. Check L2 credentials.")
                 raise RuntimeError("401 Unauthorized -- stop bot")
 
             if status >= 400:
-                log.error("Order rejected (%d): %s", status, text)
-                raise RuntimeError(f"Order rejected ({status}): {text}")
+                log.error("Order rejected (%d): %s", status, raw.decode())
+                raise RuntimeError(f"Order rejected ({status}): {raw.decode()}")
 
-            data = json.loads(text)
+            data = _loads(raw)
+            return OrderResponse(
+                order_id=data.get("order_id") or data.get("orderID"),
+                status=data.get("status", ""),
+                message=data.get("message"),
+            )
+
+    async def place_order_raw(self, body_bytes: bytes) -> OrderResponse:
+        """FASE 6: Fast path — accept pre-serialized payload from sender pipeline."""
+        path = "/order"
+        url = f"{self.clob_url}{path}"
+        body_str = body_bytes.decode()
+        headers = self._auth_headers("POST", path, body_str)
+
+        session = await self._get_session()
+        async with session.post(url, headers=headers, data=body_bytes) as resp:
+            status = resp.status
+            raw = await resp.read()
+
+            if status == 401:
+                raise RuntimeError("401 Unauthorized -- stop bot")
+            if status >= 400:
+                raise RuntimeError(f"Order rejected ({status}): {raw.decode()}")
+
+            data = _loads(raw)
             return OrderResponse(
                 order_id=data.get("order_id") or data.get("orderID"),
                 status=data.get("status", ""),
@@ -230,7 +353,8 @@ class PolymarketClient:
         session = await self._get_session()
         async with session.delete(url, headers=headers) as resp:
             if resp.status < 300:
-                log.info("Cancelled order %s", order_id)
+                if gstate._VERBOSE:
+                    log.info("Cancelled order %s", order_id)
                 return True
             text = await resp.text()
             log.warning("Cancel failed for %s (%d): %s", order_id, resp.status, text)
@@ -267,7 +391,8 @@ class PolymarketClient:
                 text = await resp.text()
                 log.warning("get_open_orders failed (%d): %s", resp.status, text)
                 return []
-            data = await resp.json()
+            raw = await resp.read()
+            data = _loads(raw)
             if isinstance(data, list):
                 return data
             return data.get("orders", data.get("data", []))
